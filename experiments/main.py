@@ -143,7 +143,8 @@ def main(args):
                                           save_top_k=-1)
 
     trainer = Trainer(
-        callbacks=checkpoint_callback,
+        enable_checkpointing=False,
+        # callbacks=checkpoint_callback,
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         deterministic=args.use_seed,
         enable_progress_bar=True,

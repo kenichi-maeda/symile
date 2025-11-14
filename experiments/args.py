@@ -155,6 +155,8 @@ def parse_args_main():
     elif args.experiment == "symile_mimic":
         parser.add_argument("--pretrained", type=str_to_bool, default=False,
                             help="Whether to pretrained encoders for CXR and ECG.")
+        parser.add_argument("--cxr_weights_path", type=Path, default=None,
+                        help="Optional path to custom weights for the CXR ResNet-50.")
 
     all_args = parser.parse_args(remaining_argv)
 

@@ -7,21 +7,43 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import models
+import timm
+
+import os
+from collections import OrderedDict
+import torch.nn.functional as F
 
 from datasets import SymileMIMICRetrievalDataset
 from losses import clip, symile, zeroshot_retrieval_logits
 from utils import PathToStrEncoder
+
+def _load_state_dict_maybe_lightning(ckpt_path):
+    sd = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(sd, dict):
+        if "state_dict" in sd and isinstance(sd["state_dict"], dict):
+            sd = sd["state_dict"]
+    return sd
+
+def _strip_prefix(sd, prefixes=("model.")):
+    out = OrderedDict()
+    for k, v in sd.items():
+        newk = k
+        for pref in prefixes:
+            if newk.startswith(pref):
+                newk = newk[len(pref):]
+        out[newk] = v
+    return out
 
 
 class CXREncoder(nn.Module):
     def __init__(self, args):
         """
         Initialize the CXREncoder, which encodes chest X-ray (CXR) images using
-        a modified ResNet-50 architecture.
+        a modified ViT-B-16 architecture.
 
-        If `args.pretrained` is True, the ResNet-50 model is initialized with
+        If `args.pretrained` is True, the ViT model is initialized with
         pre-trained weights from the ImageNet dataset ("IMAGENET1K_V2"). The
-        fully connected layer (fc) of ResNet-50 is replaced with a new Linear
+        fully connected layer (fc) of ViT-B-16 is replaced with a new Linear
         layer to match the desired output dimensionality (`args.d`). A LayerNorm
         layer is added to normalize the output features.
 
@@ -31,13 +53,30 @@ class CXREncoder(nn.Module):
         super().__init__()
 
         if args.pretrained:
-            self.resnet = models.resnet50(weights="IMAGENET1K_V2")
+            self.vit = timm.create_model(
+                "vit_base_patch16_224",
+                pretrained=True,
+                num_classes=0 
+            )
         else:
-            self.resnet = models.resnet50(pretrained=False)
+            self.vit = timm.create_model(
+                "vit_base_patch16_224",
+                pretrained=False,
+                num_classes=0 
+            )
 
-        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, args.d, bias=True)
+        embed_dim = self.vit.num_features
 
+        # Map ViT embedding -> desired dim d
+        self.proj = nn.Linear(embed_dim, args.d, bias=True) if args.d != embed_dim else nn.Identity()
         self.layer_norm = nn.LayerNorm(args.d)
+
+        # optional: load custom weights
+        if getattr(args, "cxr_weights_path", None):
+            sd = _load_state_dict_maybe_lightning(args.cxr_weights_path)
+            sd = _strip_prefix(sd, prefixes=("model.",)) 
+            missing, unexpected = self.vit.load_state_dict(sd, strict=False)
+            print(f"[timm ViT] missing={len(missing)}, unexpected={len(unexpected)}")
 
     def forward(self, x):
         """
@@ -46,9 +85,48 @@ class CXREncoder(nn.Module):
         Returns:
             x (torch.Tensor): learned CXR representation (batch_sz, d)
         """
-        x = self.resnet(x)
-        x = self.layer_norm(x)
-        return x
+        if x.shape[-2:] != (224, 224):
+            x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        feats = self.vit(x)            # (B, 768) 
+        z = self.proj(feats)           # (B, d)
+        return self.layer_norm(z)      # (B, d)
+
+# class CXREncoder(nn.Module):
+#     def __init__(self, args):
+#         """
+#         Initialize the CXREncoder, which encodes chest X-ray (CXR) images using
+#         a modified ResNet-50 architecture.
+
+#         If `args.pretrained` is True, the ResNet-50 model is initialized with
+#         pre-trained weights from the ImageNet dataset ("IMAGENET1K_V2"). The
+#         fully connected layer (fc) of ResNet-50 is replaced with a new Linear
+#         layer to match the desired output dimensionality (`args.d`). A LayerNorm
+#         layer is added to normalize the output features.
+
+#         Args:
+#             args (Namespace): A namespace object containing configuration for the model.
+#         """
+#         super().__init__()
+
+#         if args.pretrained:
+#             self.resnet = models.resnet50(weights="IMAGENET1K_V2")
+#         else:
+#             self.resnet = models.resnet50(pretrained=False)
+
+#         self.resnet.fc = nn.Linear(self.resnet.fc.in_features, args.d, bias=True)
+
+#         self.layer_norm = nn.LayerNorm(args.d)
+
+#     def forward(self, x):
+#         """
+#         Args:
+#             x (torch.Tensor): CXR data (batch_sz, 3, 320, 320).
+#         Returns:
+#             x (torch.Tensor): learned CXR representation (batch_sz, d)
+#         """
+#         x = self.resnet(x)
+#         x = self.layer_norm(x)
+#         return x
 
 
 class ECGEncoder(nn.Module):
@@ -264,6 +342,11 @@ class SymileMIMICModel(pl.LightningModule):
 
         with open(self.args.save_dir / "run_info.json", "w") as f:
             json.dump(self.run_info, f, indent=4, cls=PathToStrEncoder)
+
+        # --- export ViT weights ---
+        if self.trainer.is_global_zero: 
+            vit_sd = self.cxr_encoder.vit.state_dict()
+            torch.save(vit_sd, self.args.save_dir / "cxr_vit_final.pt")
 
     def test_step(self, batch, batch_idx):
         pass
